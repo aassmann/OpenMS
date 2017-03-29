@@ -16,8 +16,12 @@ function build_contrib {
 }
 
 # fetch contrib and build seqan
-git clone git://github.com/OpenMS/contrib/
+# git clone git://github.com/OpenMS/contrib/
+git clone git://github.com/hroest/contrib/
 pushd contrib
+
+git pull origin feature/sqlite
+
 
 # we build seqan as the versions shipped in Ubuntu are not recent enough
 build_contrib SEQAN
@@ -27,6 +31,9 @@ build_contrib WILDMAGIC
 
 # we build Eigen as the versions shipped in Ubuntu are not recent enough
 build_contrib EIGEN
+
+# lets try to build our own sqlite.
+build_contrib SQLITE
 
 # leave contrib
 popd
