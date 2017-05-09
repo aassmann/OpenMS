@@ -48,12 +48,20 @@
 #include <OpenMS/MATH/STATISTICS/StatisticFunctions.h>
 #include <OpenMS/FORMAT/ControlledVocabulary.h>
 #include <OpenMS/SYSTEM/File.h>
+#include <OpenMS/CHEMISTRY/TheoreticalSpectrumGenerator.h>
+#include <OpenMS/COMPARISON/SPECTRA/SpectrumAlignment.h>
+#include <OpenMS/ANALYSIS/MAPMATCHING/TransformationDescription.h>
+#include <OpenMS/FORMAT/TransformationXMLFile.h>
+#include <OpenMS/DATASTRUCTURES/StringListUtils.h> 
+#include <OpenMS/KERNEL/MSSpectrum.h>
+#include <OpenMS/KERNEL/RichPeak1D.h>
 
 #include <QFileInfo>
 //~ #include <boost/regex.hpp>
 
 #include <vector>
 #include <map>
+#include <set>
 
 using namespace OpenMS;
 using namespace std;
@@ -123,7 +131,7 @@ public:
 protected:
   void registerOptionsAndFlags_()
   {
-    registerInputFile_("in", "<file>", "", "raw data input file (this is relevant if you want to look at MS1, MS2 and precursor peak information)");
+    registerInputFile_("in", "<file>", "", "raw data input file (this is relevant if you want to look at MS1, MS2 and precursor peak information)", false);
     setValidFormats_("in", ListUtils::create<String>("mzML"));
     registerOutputFile_("out", "<file>", "", "Your qcML file.");
     setValidFormats_("out", ListUtils::create<String>("qcML"));
@@ -134,6 +142,10 @@ protected:
     registerInputFile_("consensus", "<file>", "", "consensus input file (this is only used for charge state deconvoluted output. Use the consensusXML output form the DeCharger)", false);
     setValidFormats_("consensus", ListUtils::create<String>("consensusXML"));
     registerFlag_("remove_duplicate_features", "This flag should be set, if you work with a set of merged features.");
+    registerInputFileList_("in_features", "<files>", StringList(),"feature input files before map alignment", false);
+    setValidFormats_("in_features", ListUtils::create<String>("featureXML"));
+    registerInputFileList_("in_trafos", "<files>", StringList(),"trafoXML files as calculated by map alignment", false);
+    setValidFormats_("in_trafos", ListUtils::create<String>("trafoXML"));
     //~ registerFlag_("MS1", "This flag should be set, if you want to work with MS1 stats.");
     //~ registerFlag_("MS2", "This flag should be set, if you want to work with MS2 stats.");
   }
@@ -198,6 +210,29 @@ protected:
     return sn_by_max2median_norm;
   }
 
+  void addPeptidesToMap (const vector<PeptideIdentification>& pep_ids, map<String, vector<double> >& rtmap, Size filecount, Size fileindex)
+  {
+    for (vector<PeptideIdentification>::const_iterator pit = pep_ids.begin(); pit != pep_ids.end(); ++pit)
+    {
+      const vector<PeptideHit>& temp_hits = pit->getHits();
+      for (Size j = 0; j < temp_hits.size(); ++j)
+      {
+        String seq = temp_hits[j].getSequence().toString();
+        map<String, vector<double> >::iterator mit = rtmap.find(seq);
+        if (mit == rtmap.end())
+        {
+          vector<double> v(filecount,-1);
+          v[fileindex] = pit->getRT();
+          rtmap[seq] = v;
+        }
+        else 
+        {
+          rtmap[seq][fileindex] = pit->getRT();
+        }
+      }
+    }
+  }
+
   ExitCodes main_(int, const char**)
   {
     vector<ProteinIdentification> prot_ids;
@@ -211,6 +246,8 @@ protected:
     String inputfile_consensus = getStringOption_("consensus");
     String inputfile_raw = getStringOption_("in");
     String outputfile_name = getStringOption_("out");
+    StringList inputfiles_feature = getStringList_("in_features");
+    StringList inputfiles_trafo = getStringList_("in_trafos");
 
     //~ bool Ms1(getFlag_("MS1"));
     //~ bool Ms2(getFlag_("MS2"));
@@ -224,6 +261,142 @@ protected:
     cv.loadFromOBO("QC", File::find("/CV/qc-cv.obo"));
  
      QcMLFile qcmlfile;
+
+    //------------------------------------------------------------
+    // if trafo&feature files given, build "map alignment qcml"
+    //------------------------------------------------------------
+    if (inputfiles_feature.size() && inputfiles_trafo.size())
+    {
+      if (inputfiles_feature.size() == inputfiles_trafo.size())
+      {
+        // need to register a dummy run, because we ignore the raw file 
+        qcmlfile.registerRun("dummy","dummy");
+        QcMLFile::Attachment at;
+        at.cvRef = "QC"; ///< cv reference
+        at.cvAcc = "QC:0000048"; // value table
+        at.qualityRef = "dummy_quality_ref";
+        at.id = "dummy_id";
+        try
+        {
+          const ControlledVocabulary::CVTerm& term = cv.getTerm(at.cvAcc);
+          at.name = term.name; ///< Name
+        }
+        catch (...)
+        {
+          at.name = "map alignment table";
+        }
+        at.colTypes.push_back("File");
+        at.colTypes.push_back("RT_old");
+        at.colTypes.push_back("RT_new");
+        at.colTypes.push_back("Anchor");
+
+        map<String,vector<double> > rtmap; // peptide -> RT in each file
+        Size filecount = inputfiles_feature.size();
+        vector<TransformationDescription> trafos;
+        vector<set<double> > trafodata;
+
+        for (Size i = 0; i < filecount; ++i)
+        {
+          FeatureMap fmap;
+          FeatureXMLFile f;
+          cerr << "processing files " << i+1 << "/" << filecount << endl;
+          f.load(inputfiles_feature[i], fmap);
+
+          // go through all assigned & unassigned peptide hits and 
+          // insert the peptide sequences with their RTs in the map
+          for (FeatureMap::ConstIterator it = fmap.begin(); it != fmap.end(); ++it)
+          {
+            const vector<PeptideIdentification>& temp_ids = it->getPeptideIdentifications();
+            addPeptidesToMap(temp_ids, rtmap, filecount, i);
+          }
+          const vector<PeptideIdentification>& unassigned_ids = fmap.getUnassignedPeptideIdentifications();
+          addPeptidesToMap(unassigned_ids, rtmap, filecount, i);
+
+          TransformationDescription trafo;
+          TransformationXMLFile trafoxml; 
+          trafoxml.load(inputfiles_trafo[i], trafo);
+          trafos.push_back(trafo);
+
+          // using a set to save the RT datapoints used by the trafo to easier look up values later
+          set<double> rts;  
+          const TransformationDescription::DataPoints& datapoints = trafo.getDataPoints(); 
+          for (TransformationDescription::DataPoints::const_iterator it = datapoints.begin(); it != datapoints.end(); ++it)
+          {
+            rts.insert(it->first);
+          }
+          trafodata.push_back(rts);
+        }
+
+        double rt_min = 1e42;
+        double rt_max = 0;
+
+        for (map<String,vector<double> >::const_iterator it = rtmap.begin(); it != rtmap.end(); ++it)
+        {
+          for (Size i = 0; i < filecount; ++i)
+          {
+            vector<String> row;
+            double rt_old = it->second[i];
+            double rt_new = rt_old < 0 ? rt_old : trafos[i].apply(rt_old);
+            row.push_back( QFileInfo(QString::fromStdString(inputfiles_feature[i])).baseName() );
+            row.push_back(rt_old);
+            row.push_back(rt_new);
+            set<double>::const_iterator iter = trafodata[i].lower_bound(rt_old);
+            // anchor; is 1 if peptide RT was used for the trafo, otherwise 0
+            // 0.001 should hopefully be low enough to ensure few false matches by chance 
+            row.push_back((iter != trafodata[i].end() && OpenMS::Math::approximatelyEqual(*iter,rt_old,0.001)) || 
+                          (iter != trafodata[i].begin() && OpenMS::Math::approximatelyEqual(*--iter,rt_old,0.001)));
+            at.tableRows.push_back(row);
+            if (rt_old > rt_max) rt_max = rt_old;
+            if (rt_new > rt_max) rt_max = rt_new;
+            if (rt_old < rt_min && rt_old > 0) rt_min = rt_old;
+            if (rt_new < rt_min && rt_new > 0) rt_min = rt_new;
+          }
+        }
+
+        qcmlfile.addRunAttachment("dummy", at);
+
+
+        // attachment with trafo sampling data for plotting  
+        at = QcMLFile::Attachment();
+        at.cvRef = "QC"; ///< cv reference
+        at.cvAcc = "QC:0000049"; // generic value table
+        at.qualityRef = "dummy_quality_ref2";
+        at.id = "dummy_id2";
+        try
+        {
+          const ControlledVocabulary::CVTerm& term = cv.getTerm(at.cvAcc);
+          at.name = term.name; ///< Name
+        }
+        catch (...)
+        {
+          at.name = "trafos";
+        }
+        at.colTypes.push_back("Trafo");
+        at.colTypes.push_back("RT_old");
+        at.colTypes.push_back("RT_new");
+        
+        for (Size i = 0; i < trafos.size(); ++i)
+        {
+          for (double k = rt_min; k < rt_max; k += (rt_max-rt_min)/1000)
+          {
+            vector<String> row;
+            row.push_back( QFileInfo(QString::fromStdString(inputfiles_trafo[i])).baseName() );
+            row.push_back(k);
+            row.push_back(trafos[i].apply(k));
+            at.tableRows.push_back(row);
+          }
+        }
+
+        qcmlfile.addRunAttachment("dummy", at);
+        qcmlfile.store(outputfile_name);
+      } 
+      else 
+      {
+        cerr << "Abort. Number of feature and trafo inputfiles must be equal." << endl;
+      }
+      return EXECUTION_OK;
+    }
+
 
     //-------------------------------------------------------------
     // MS acquisition
@@ -904,6 +1077,89 @@ protected:
             row.push_back(pep_mods[w]);
           }
           at.tableRows.push_back(row);
+        }
+      }
+      qcmlfile.addRunAttachment(base_name, at);
+
+      
+      at = QcMLFile::Attachment();
+      at.cvRef = "QC"; ///< cv reference
+      at.cvAcc = "QC:0000048"; // todo add new acc to obo
+      at.qualityRef = msid_ref;
+      at.id = base_name + "_ms2massacc"; ///< Identifier
+      try
+      {
+        const ControlledVocabulary::CVTerm& term = cv.getTerm(at.cvAcc);
+        at.name = term.name; ///< Name
+      }
+      catch (...)
+      {
+        at.name = "ms2 delta ppm tables";
+      }
+      
+      at.colTypes.push_back("PrecursorRT");
+      at.colTypes.push_back("FragmentMZ");
+      at.colTypes.push_back("TheoreticalWeight");
+      at.colTypes.push_back("delta_ppm");
+      at.colTypes.push_back("delta_da");
+      //at.colTypes.push_back("Iontype");
+
+      PeakMap::Iterator sit = exp.begin();
+      TheoreticalSpectrumGenerator tsg;
+
+      SpectrumAlignment sa;
+      {
+        Param param;
+        param.setValue("tolerance", 0.6); // which value?
+        //param.setValue("is_relative_tolerance", "true");
+        sa.setParameters(param);
+      }
+
+      for (vector<PeptideIdentification>::iterator it = pep_ids.begin(); it != pep_ids.end(); ++it) // pep_ids should be sorted by RT
+      {
+        //cerr << (pep_ids.end() - it);
+        if (!it->getHits().empty())
+        {
+          PeptideHit pep = it->getHits().front();  //N.B.: depends on score & sort
+          while (!OpenMS::Math::approximatelyEqual(it->getRT(),sit->getRT(),0.01) && sit != exp.end())
+          {
+            ++sit;
+          }
+          if (sit == exp.end())
+          {
+            cerr << "Warning. No spectrum for peptide hit with RT " << it->getRT() << " found in experiment. Attachment is incomplete." << endl;
+            break;
+          }
+          RichPeakSpectrum theoretical_spec;
+          tsg.addPeaks(theoretical_spec, pep.getSequence(), Residue::YIon, 1);
+          tsg.addPeaks(theoretical_spec, pep.getSequence(), Residue::BIon, 1);
+
+          if (sit->getType() == SpectrumSettings::PEAKS)
+          {
+            sit->sortByPosition();
+
+            vector<pair<Size,Size> > alignment;
+            sa.getSpectrumAlignment(alignment, theoretical_spec, *sit);
+
+            for (vector<pair<Size,Size> >::const_iterator pit = alignment.begin(); pit != alignment.end(); ++pit)
+            {
+              std::vector<String> row;
+              double theo_mz = theoretical_spec[pit->first].getMZ();
+              double obs_mz = (*sit)[pit->second].getMZ();
+              double ppm = OpenMS::Math::getPPM(obs_mz,theo_mz);
+              row.push_back(it->getRT());
+              row.push_back(obs_mz);
+              row.push_back(theo_mz);
+              row.push_back(ppm);
+              row.push_back(OpenMS::Math::ppmToMass(ppm,theo_mz));
+              at.tableRows.push_back(row);
+            }
+          }
+          else
+          {
+            cerr << "Skipping spectrum at RT " << sit->getRT() << ". SpectrumType is not PEAKS." << endl;
+          }
+          
         }
       }
       qcmlfile.addRunAttachment(base_name, at);
